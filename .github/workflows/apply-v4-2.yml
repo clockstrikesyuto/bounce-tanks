@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'v4_2.patch'
+      - 'v4_2_apply.py'
 
 permissions:
   contents: write
@@ -16,11 +16,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Apply v4.2 patch
+      - name: Apply v4.2 local-first controls
         run: |
-          git apply --check v4_2.patch
-          git apply v4_2.patch
-          rm v4_2.patch
+          python v4_2_apply.py
+          rm v4_2_apply.py
+          rm -f v4_2.patch
           rm .github/workflows/apply-v4-2.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
