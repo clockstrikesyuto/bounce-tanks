@@ -17,7 +17,7 @@
   <div class="brand"><div class="brandMain"><div class="logo">💥</div><div><h1>BOUNCE TANKS</h1><small>跳ね返して、生き残れ。</small></div></div><div class="pill" id="conn">OFFLINE</div></div>
 
   <section id="home" class="screen on">
-    <div class="card hero"><div class="eyebrow">BOUNCE TANKS v4.1</div><h2>1人でも。<br>みんなでも。</h2><p>壁で跳ね返る弾を使った迷路戦車バトル。v4.1では滑らかさを維持しつつ、操作中の巻き戻りを抑制。</p></div>
+    <div class="card hero"><div class="eyebrow">BOUNCE TANKS v4.2</div><h2>1人でも。<br>みんなでも。</h2><p>壁で跳ね返る弾を使った迷路戦車バトル。v4.2ではローカル操作優先の同期に変更し、巻き戻りと入力抜けをさらに抑制。</p></div>
     <div class="card">
       <label>あなたの名前</label><input id="hostName" maxlength="18" placeholder="ゆうと">
       <div class="modeCards" style="margin-top:12px">
@@ -36,7 +36,7 @@
 
 <script>
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)],parts=location.pathname.split('/').filter(Boolean);
-let code=null,role=null,hostToken=null,playerId=null,playerToken=null,ws=null,state=null,retry=null,gameMounted=false,lobbySig='',input={up:false,down:false,left:false,right:false,shoot:false},motionReleaseAt=0;
+let code=null,role=null,hostToken=null,playerId=null,playerToken=null,ws=null,state=null,retry=null,gameMounted=false,lobbySig='',input={up:false,down:false,left:false,right:false,shoot:false},motionReleaseAt=0,lastInputHeartbeat=0,activePointers=new Map();
 let visualPlayers=new Map(),visualBullets=new Map(),rafId=0,lastFrameAt=performance.now(),spawnKey='',localMuzzleUntil=0,scoreSig='',survSig='',reactionSig='',killSig='',chatSig='';
 const ITEM={laser:['⚡','LASER'],shotgun:['🔱','SHOTGUN'],shield:['🛡️','SHIELD'],mine:['💣','MINE']},sk=(k,c)=>`bt_${k}_${c}`;
 const TANK_R=20,TANK_SPEED=190,TURN_SPEED=2.8;
@@ -75,31 +75,27 @@ function advanceVisual(dt){
       if(!blockedVisual(v.x+dx,v.y,state.walls))v.x+=dx;
       if(!blockedVisual(v.x,v.y+dy,state.walls))v.y+=dy;
 
-      // The authoritative state is intentionally a little behind the local prediction.
-      // While the player is holding a control, ignore that normal latency-sized gap so
-      // the tank never gets tugged backwards every snapshot. Reconcile only meaningful drift.
-      let err=Math.hypot(v.tx-v.x,v.ty-v.y),releaseGrace=!moving&&motionReleaseAt&&now-motionReleaseAt<180;
-      if(err>170){v.x=v.tx;v.y=v.ty}
-      else if(moving){
-        if(err>42){let a=expAlpha(err>95?2.2:.65,dt);v.x+=(v.tx-v.x)*a;v.y+=(v.ty-v.y)*a}
-      }else if(releaseGrace){
-        if(err>78){let a=expAlpha(2.4,dt);v.x+=(v.tx-v.x)*a;v.y+=(v.ty-v.y)*a}
-      }else{
-        let a=expAlpha(9.5,dt);v.x+=(v.tx-v.x)*a;v.y+=(v.ty-v.y)*a;
+      // v4.2: while a human is actively steering, the local tank is display-authoritative.
+      // Server snapshots are still stored as targets, but never pull the tank backwards
+      // during a press. After release we wait for the reliable WebSocket input to reach
+      // the server, then reconcile smoothly without teleporting.
+      let err=Math.hypot(v.tx-v.x,v.ty-v.y),releaseGrace=!moving&&motionReleaseAt&&now-motionReleaseAt<360;
+      if(!moving&&!releaseGrace){
+        let rate=err>120?4.8:err>45?3.4:err>10?5.8:11.5,a=expAlpha(rate,dt);
+        v.x+=(v.tx-v.x)*a;v.y+=(v.ty-v.y)*a;
       }
 
-      let ad=Math.abs(angleDelta(v.ta,v.a));
-      if(ad>1.25)v.a=v.ta;
-      else if(turning){if(ad>.16)v.a+=angleDelta(v.ta,v.a)*expAlpha(.7,dt)}
-      else if(releaseGrace){if(ad>.3)v.a+=angleDelta(v.ta,v.a)*expAlpha(2.2,dt)}
-      else v.a+=angleDelta(v.ta,v.a)*expAlpha(10,dt);
+      if(!moving&&!releaseGrace){
+        let ad=Math.abs(angleDelta(v.ta,v.a)),rate=ad>.8?4.8:ad>.2?6.5:11;
+        v.a+=angleDelta(v.ta,v.a)*expAlpha(rate,dt);
+      }
     }else{
       let a=expAlpha(p.bot?13:17,dt);v.x+=(v.tx-v.x)*a;v.y+=(v.ty-v.y)*a;v.a+=angleDelta(v.ta,v.a)*a;
     }
   }
   for(let v of visualBullets.values()){let a=expAlpha(24,dt);v.x+=(v.tx-v.x)*a;v.y+=(v.ty-v.y)*a}
 }
-function startRenderLoop(){if(rafId)return;lastFrameAt=performance.now();const loop=now=>{rafId=requestAnimationFrame(loop);let dt=Math.min(.04,(now-lastFrameAt)/1000);lastFrameAt=now;advanceVisual(dt);if(state&&gameMounted)draw(state)};rafId=requestAnimationFrame(loop)}
+function startRenderLoop(){if(rafId)return;lastFrameAt=performance.now();const loop=now=>{rafId=requestAnimationFrame(loop);let dt=Math.min(.04,(now-lastFrameAt)/1000);lastFrameAt=now;if((motionHeld()||input.shoot)&&now-lastInputHeartbeat>120){lastInputHeartbeat=now;sendInput()}advanceVisual(dt);if(state&&gameMounted)draw(state)};rafId=requestAnimationFrame(loop)}
 function stopRenderLoop(){if(rafId){cancelAnimationFrame(rafId);rafId=0}visualPlayers.clear();visualBullets.clear();spawnKey=''}
 function instantFireFeedback(){localMuzzleUntil=performance.now()+110}
 async function api(url,opt={}){let r=await fetch(url,{headers:{'Content-Type':'application/json'},...opt});if(!r.ok){let j={};try{j=await r.json()}catch{}throw Error(j.detail||'通信に失敗しました')}return r.json()}
@@ -113,18 +109,19 @@ function send(action,extra={}){if(ws?.readyState===1)ws.send(JSON.stringify({act
 function sendInput(){send('input',{keys:input})}
 function motionHeld(){return !!(input.up||input.down||input.left||input.right)}
 function setInput(k,v){if(input[k]===v)return;let wasMotion=motionHeld(),isMotionKey=k==='up'||k==='down'||k==='left'||k==='right';input[k]=v;if(isMotionKey&&wasMotion&&!motionHeld())motionReleaseAt=performance.now();else if(isMotionKey&&motionHeld())motionReleaseAt=0;sendInput()}
-function resetInput(){let changed=false;for(let k in input){if(input[k])changed=true;input[k]=false}$$('[data-key]').forEach(b=>b.classList.remove('on'));if(changed)sendInput()}
+function resetInput(){let changed=false;activePointers.clear();for(let k in input){if(input[k])changed=true;input[k]=false}$$('[data-key]').forEach(b=>b.classList.remove('on'));if(changed)sendInput()}
 function humanList(s){return s.players.filter(p=>!p.bot)}
 function playersHtml(s){return s.players.filter(p=>!p.bot).map(p=>`<div class="player"><span class="dot" style="background:${p.color};color:${p.color}"></span><strong>${esc(p.name)}</strong>${p.id===s.host_player_id?'<span class="hostBadge">HOST</span>':''}</div>`).join('')}
 function scores(s){return humanList(s).map(p=>`<div class="scoreChip" style="border-color:${p.color}66"><span style="color:${p.color}">●</span> ${esc(p.name)} <strong>${p.score}</strong>/${s.target_score}</div>`).join('')}
 function settingsHtml(s){let status=s.items_enabled?'あり':'なし';if(!s.is_host)return `<div class="settingsBox"><div class="smallcaps">GAME SETTINGS</div><div class="summary">${s.mode==='battle'?`${s.target_score}点先取・`:''}アイテム ${status}</div></div>`;return `<div class="settingsBox"><div class="smallcaps">ITEMS</div><div class="seg"><button id="itemsOff" class="${!s.items_enabled?'on':''}">なし</button><button id="itemsOn" class="${s.items_enabled?'on':''}">あり</button></div><div class="summary">${s.items_enabled?'⚡🔱🛡️💣 がマップに出現':'通常弾だけの純粋な反射バトル'}</div></div>`}
 function bindLobbySettings(){if($('#itemsOff'))$('#itemsOff').onclick=()=>send('set_items',{enabled:false});if($('#itemsOn'))$('#itemsOn').onclick=()=>send('set_items',{enabled:true})}
 function renderLobby(s){let sig=`${s.players.filter(p=>!p.bot).map(p=>p.id+':'+p.name).join('|')}|${s.is_host}|${s.target_score}|${s.items_enabled}|${s.mode}`;if(sig===lobbySig)return;lobbySig=sig;
-  if(s.mode==='survival'){$('#lobby').innerHTML=`<div class="card hero center"><div class="eyebrow">SOLO SURVIVAL</div><h2 style="font-size:38px">WAVEを<br>生き残れ。</h2><p>CPUを倒すほど敵が増えて強くなります。自分の弾での自爆にも注意。</p><div class="smoothBadge">⚡ v4.1 SMOOTH CONTROL</div></div><div class="card"><div class="player"><span class="dot" style="background:${humanList(s)[0]?.color};color:${humanList(s)[0]?.color}"></span><strong>${esc(humanList(s)[0]?.name||'PLAYER')}</strong><span class="hostBadge">PLAYER</span></div>${settingsHtml(s)}${s.is_host?'<button class="btn solo" id="start">SURVIVAL開始</button>':''}<button class="btn ghost" id="menuBackLobby">← メインメニューに戻る</button></div>`;bindLobbySettings();if($('#start'))$('#start').onclick=()=>send('start');if($('#menuBackLobby'))$('#menuBackLobby').onclick=goHome;return}
+  if(s.mode==='survival'){$('#lobby').innerHTML=`<div class="card hero center"><div class="eyebrow">SOLO SURVIVAL</div><h2 style="font-size:38px">WAVEを<br>生き残れ。</h2><p>CPUを倒すほど敵が増えて強くなります。自分の弾での自爆にも注意。</p><div class="smoothBadge">⚡ v4.2 LOCAL CONTROL</div></div><div class="card"><div class="player"><span class="dot" style="background:${humanList(s)[0]?.color};color:${humanList(s)[0]?.color}"></span><strong>${esc(humanList(s)[0]?.name||'PLAYER')}</strong><span class="hostBadge">PLAYER</span></div>${settingsHtml(s)}${s.is_host?'<button class="btn solo" id="start">SURVIVAL開始</button>':''}<button class="btn ghost" id="menuBackLobby">← メインメニューに戻る</button></div>`;bindLobbySettings();if($('#start'))$('#start').onclick=()=>send('start');if($('#menuBackLobby'))$('#menuBackLobby').onclick=goHome;return}
   let url=location.origin+`/join/${s.code}`;$('#lobby').innerHTML=`<div class="card center"><div class="smallcaps">ROOM CODE</div><div class="code">${s.code}</div>${s.is_host?`<img class="qr" src="/room/${s.code}/qr" alt="参加用QRコード"><div class="copyline"><input id="joinUrl" value="${esc(url)}" readonly><button class="btn secondary" id="copy" style="margin:0">コピー</button></div><p class="hint">QRコードかURLを友達に送って参加。</p>`:'<p class="hint">ホストがゲームを始めるまで待ってね。</p>'}</div><div class="card"><div class="smallcaps">PLAYERS ${humanList(s).length}/4</div><div class="players">${playersHtml(s)}</div>${settingsHtml(s)}${s.is_host?`<button class="btn" id="start" ${humanList(s).length<2?'disabled':''}>${humanList(s).length<2?'あと1人で開始':`${humanList(s).length}人でゲーム開始`}</button>`:''}</div>`;
   bindLobbySettings();if($('#copy'))$('#copy').onclick=async()=>{try{await navigator.clipboard.writeText(url);toast('参加URLをコピーしました')}catch{toast(url)}};if($('#start'))$('#start').onclick=()=>send('start')}
 function render(s){if(s.stage==='lobby'){gameMounted=false;resetInput();stopRenderLoop();$('#game').innerHTML='';$('#game').style.display='none';$('#lobby').style.display='block';renderLobby(s);return}lobbySig='';$('#lobby').style.display='none';$('#game').style.display='block';if(!gameMounted)mountGame(s);updateGame(s)}
-function bindHoldButton(b){let k=b.dataset.key,on=e=>{e.preventDefault();if(b.disabled)return;try{b.setPointerCapture(e.pointerId)}catch{}b.classList.add('on');setInput(k,true);if(k==='shoot'){instantFireFeedback();send('shoot')}},off=e=>{e.preventDefault();b.classList.remove('on');setInput(k,false);try{if(b.hasPointerCapture(e.pointerId))b.releasePointerCapture(e.pointerId)}catch{}};b.addEventListener('pointerdown',on,{passive:false});b.addEventListener('pointerup',off,{passive:false});b.addEventListener('pointercancel',off,{passive:false});b.addEventListener('lostpointercapture',()=>{b.classList.remove('on');setInput(k,false)});b.addEventListener('contextmenu',e=>e.preventDefault());b.addEventListener('selectstart',e=>e.preventDefault());b.addEventListener('dragstart',e=>e.preventDefault())}
+function releasePointer(pointerId){let k=activePointers.get(pointerId);if(!k)return;activePointers.delete(pointerId);if(![...activePointers.values()].includes(k)){let b=$(`[data-key="${k}"]`);b?.classList.remove('on');setInput(k,false)}}
+function bindHoldButton(b){let k=b.dataset.key,on=e=>{e.preventDefault();if(b.disabled)return;activePointers.set(e.pointerId,k);try{b.setPointerCapture(e.pointerId)}catch{}b.classList.add('on');setInput(k,true);if(k==='shoot'){instantFireFeedback();send('shoot')}};b.addEventListener('pointerdown',on,{passive:false});b.addEventListener('pointerup',e=>{e.preventDefault();releasePointer(e.pointerId)},{passive:false});b.addEventListener('pointercancel',e=>{e.preventDefault();releasePointer(e.pointerId)},{passive:false});b.addEventListener('lostpointercapture',()=>{});b.addEventListener('contextmenu',e=>e.preventDefault());b.addEventListener('selectstart',e=>e.preventDefault());b.addEventListener('dragstart',e=>e.preventDefault())}
 function mountGame(s){gameMounted=true;let battle=s.mode==='battle';$('#game').innerHTML=`<div class="card gameCard gameNoSelect"><div class="hudTop"><div id="scoreboard" class="scoreboard"></div><div id="survivalHud" class="survivalHud"></div></div><div class="landscapeHint">📱 横画面にすると遊びやすいよ</div><div class="canvasWrap" id="canvasWrap"><canvas id="cv" width="1000" height="640"></canvas><div class="banner" id="banner"></div><div class="killfeed" id="killfeed"></div><div class="reactionToast" id="reactionToast"></div></div><div class="controls" id="controls"><div class="dpad"><button class="ctrl up" data-key="up">▲</button><button class="ctrl left" data-key="left">◀</button><button class="ctrl down" data-key="down">▼</button><button class="ctrl right" data-key="right">▶</button></div><div class="rightControls"><button class="shoot" data-key="shoot"><span>💥</span>FIRE</button><button class="itemBtn" id="itemBtn" disabled>ITEM －</button></div></div><div class="spectator" id="spectator">👀 観戦中 <span>次ラウンドで復帰</span></div><div class="itemLegend" id="itemLegend"><span>⚡ レーザー</span><span>🔱 ショットガン</span><span>🛡️ シールド</span><span>💣 地雷</span></div>${battle?`<div class="chatRow on" id="chatRow"><div class="chatLine empty" id="chatLine">チャットはここに1行だけ表示</div><input id="chatInput" maxlength="60" placeholder="ひとこと…"><button class="chatSend" id="chatSend">送信</button></div><div class="reactions">${['🔥','😂','💥','😭','👏'].map(e=>`<button class="react" data-react="${e}">${e}</button>`).join('')}</div><button class="btn" id="again" style="display:none">ロビーに戻る</button>`:`<div class="gameActions"><button class="btn secondary" id="again" style="display:none">SURVIVALロビーへ</button><button class="btn ghost" id="menuBackGame">← メインメニュー</button></div>`}</div>`;
   $$('[data-key]').forEach(bindHoldButton);$('#itemBtn').addEventListener('click',e=>{e.preventDefault();send('use_item')});$('#itemBtn').addEventListener('contextmenu',e=>e.preventDefault());$$('[data-react]').forEach(b=>b.onclick=()=>send('reaction',{emoji:b.dataset.react}));$('#again').onclick=()=>send('reset');if($('#menuBackGame'))$('#menuBackGame').onclick=goHome;if($('#chatSend')){$('#chatSend').onclick=sendChat;$('#chatInput').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendChat()}})}$('#game').addEventListener('contextmenu',e=>{if(e.target.closest('.controls'))e.preventDefault()});$('#game').addEventListener('selectstart',e=>{if(e.target.closest('.controls'))e.preventDefault()});syncVisualState(s);startRenderLoop()}
 function sendChat(){let i=$('#chatInput');if(!i)return;let text=i.value.trim();if(!text)return;send('chat',{text});i.value=''}
@@ -151,6 +148,7 @@ function draw(s){let c=$('#cv');if(!c)return;let x=c.getContext('2d');x.clearRec
   for(let p of s.players){let v=visualPlayers.get(p.id),px=v?.x??p.x,py=v?.y??p.y,pa=v?.a??p.angle;x.save();x.translate(px,py);x.rotate(pa);x.globalAlpha=p.alive?1:.18;x.fillStyle=p.color;x.fillRect(-20,-15,40,30);x.fillStyle='#0b1118';x.fillRect(-14,-8,28,16);x.fillStyle=p.color;x.fillRect(3,-5,30,10);x.beginPath();x.arc(0,0,8,0,Math.PI*2);x.fill();x.restore();if(p.shield&&p.alive){x.beginPath();x.arc(px,py,29,0,Math.PI*2);x.strokeStyle='#9eeeff';x.lineWidth=4;x.shadowColor='#64e5ff';x.shadowBlur=14;x.stroke();x.shadowBlur=0}x.font='700 13px system-ui';x.textAlign='center';x.fillStyle=p.alive?'#fff':'#738093';x.fillText(p.name,px,py-30);if(p.item&&p.alive){x.font='18px system-ui';x.fillText((ITEM[p.item]||['?'])[0],px+27,py-23)}}
   let me=s.players.find(p=>p.id===s.player_id),mv=me&&visualPlayers.get(me.id);if(me&&mv&&me.alive&&performance.now()<localMuzzleUntil){let mx=mv.x+Math.cos(mv.a)*35,my=mv.y+Math.sin(mv.a)*35;x.save();x.fillStyle='#fff2ad';x.shadowColor='#ffd15c';x.shadowBlur=18;x.beginPath();x.arc(mx,my,11,0,Math.PI*2);x.fill();x.restore()}
   for(let e of s.effects||[]){let phase=Math.max(0,Math.min(1,e.ttl/.75));if(e.kind==='laser'){x.save();x.strokeStyle=e.color||'#fff';x.lineWidth=7;x.shadowColor=x.strokeStyle;x.shadowBlur=22;x.beginPath();x.moveTo(e.x1,e.y1);x.lineTo(e.x2,e.y2);x.stroke();x.restore()}else if(e.kind==='explosion'){let r=20+(1-phase)*55;x.save();x.globalAlpha=Math.min(1,phase*1.5);let g=x.createRadialGradient(e.x,e.y,2,e.x,e.y,r);g.addColorStop(0,'#fff8cf');g.addColorStop(.25,'#ffcf52');g.addColorStop(.6,'#ff7043');g.addColorStop(1,'rgba(255,50,30,0)');x.fillStyle=g;x.beginPath();x.arc(e.x,e.y,r,0,Math.PI*2);x.fill();x.restore()}else if(e.kind==='shield_break'||e.kind==='shield_on'){x.save();x.globalAlpha=phase;x.strokeStyle='#a8f2ff';x.lineWidth=5;x.beginPath();x.arc(e.x,e.y,28+(1-phase)*28,0,Math.PI*2);x.stroke();x.restore()}else if(e.kind==='pickup'){x.save();x.globalAlpha=phase;x.font='30px system-ui';x.textAlign='center';x.fillText(e.text||'✨',e.x,e.y-30-(1-phase)*18);x.restore()}else if(e.kind==='muzzle'){x.save();x.globalAlpha=phase;x.fillStyle='#fff0a8';x.beginPath();x.arc(e.x,e.y,10+(1-phase)*10,0,Math.PI*2);x.fill();x.restore()}}}
+addEventListener('pointerup',e=>releasePointer(e.pointerId),true);addEventListener('pointercancel',e=>releasePointer(e.pointerId),true);
 const keyMap={ArrowUp:'up',w:'up',W:'up',ArrowDown:'down',s:'down',S:'down',ArrowLeft:'left',a:'left',A:'left',ArrowRight:'right',d:'right',D:'right',' ':'shoot',e:'item',E:'item'};
 addEventListener('keydown',e=>{if(['INPUT','TEXTAREA','SELECT'].includes(e.target?.tagName))return;let k=keyMap[e.key];if(!k||!gameMounted)return;e.preventDefault();if(k==='item'){if(!e.repeat)send('use_item');return}if(!input[k]){setInput(k,true);if(k==='shoot'){instantFireFeedback();send('shoot')}}});addEventListener('keyup',e=>{if(['INPUT','TEXTAREA','SELECT'].includes(e.target?.tagName))return;let k=keyMap[e.key];if(!k||!gameMounted||k==='item')return;e.preventDefault();setInput(k,false)});addEventListener('blur',resetInput);document.addEventListener('visibilitychange',()=>{if(document.hidden)resetInput()});
 if(parts[0]==='host'&&parts[1]){code=parts[1];hostInit()}else if(parts[0]==='join'&&parts[1]){code=parts[1];joinInit()}else show('home');
