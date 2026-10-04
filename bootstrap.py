@@ -21,6 +21,11 @@ if not (RUNTIME / "game_registry.py").exists():
 
 sys.path.insert(0, str(RUNTIME))
 
+# The branch app imports the historical module name "game_engine".
+# Keep that import compatible with the new split registry without touching main.
+import game_registry
+sys.modules["game_engine"] = game_registry
+
 import app as server
 
 # app.py resolves the front-end file through BASE at request time.
